@@ -8,7 +8,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#include "driver/twai.h"
 #include "tinyusb.h"
 #include "class/vendor/vendor_device.h"
 #include "esp_log.h"
@@ -16,26 +15,25 @@
 #include "led_service.h"
 #include "board_pins.h"
 #include "gs_usb.h"
-#include "dbg_helpers.h" 
-#include "gsusb_device.h"
+
+#include "gsusb_can.h"
+#include "gsusb_usb.h"
 
 
-static volatile bool can_active       = false;  
-static volatile bool can_initialized  = false;  
 
-static SemaphoreHandle_t can_mutex    = nullptr;
-static TaskHandle_t      h_usb_tx_task = nullptr;
+
+static TaskHandle_t h_usb_tx_task = nullptr;
+
+
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
 #define CAN_CLOCK_SPEED 80000000UL
-
-// USB descriptor
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
 
 static uint32_t gs_resp_identify = 0xBEBAFECA;
 
 static const struct gs_host_config gs_resp_host_format = {
-    .byte_order = 0x0000beef
+    .byte_order = 0x0000beef 
 };
 
 static struct gs_device_config gs_resp_conf = {
@@ -63,106 +61,13 @@ static struct gs_device_bt_const gs_resp_btc = {
 
 static struct gs_device_bittiming temp_bt;
 static struct gs_device_mode     temp_mode;
-static uint32_t temp_host_format;
+static uint32_t                  temp_host_format;
+
 
 extern "C" void tinyusb_task(void *param);
 extern "C" void can_rx_task(void *arg);
 extern "C" void usb_tx_task(void *arg);
 
-
-static bool set_can_bittiming(const struct gs_device_bittiming *bt)
-{
-    twai_general_config_t g_config =
-        TWAI_GENERAL_CONFIG_DEFAULT(TX_CAN, RX_CAN, TWAI_MODE_NORMAL);
-    g_config.tx_queue_len = 20;
-    g_config.rx_queue_len = 20;
-    g_config.alerts_enabled = TWAI_ALERT_RX_DATA |
-                              TWAI_ALERT_BUS_OFF |
-                              TWAI_ALERT_BUS_ERROR;
-
-    twai_timing_config_t t_config = {};
-    t_config.brp             = bt->brp;
-    t_config.tseg_1          = bt->prop_seg + bt->phase_seg1;  
-    t_config.tseg_2          = bt->phase_seg2;
-    t_config.sjw             = bt->sjw;
-    t_config.triple_sampling = false;
-
-    GSUSB_LOGI("GSUSB",
-               "set_can_bittiming: brp=%" PRIu32
-               " prop=%" PRIu32 " phase1=%" PRIu32
-               " phase2=%" PRIu32 " sjw=%" PRIu32
-               " => tseg1=%u tseg2=%u",
-               bt->brp, bt->prop_seg, bt->phase_seg1,
-               bt->phase_seg2, bt->sjw,
-               (unsigned)t_config.tseg_1,
-               (unsigned)t_config.tseg_2);
-
-    if (t_config.tseg_1 > 16 || t_config.tseg_2 > 8)
-    {
-        GSUSB_LOGE("GSUSB", "Bit timing out of range, rejecting");
-        return false;
-    }
-
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    // Reinstall driver if it was already initialized
-    if (can_initialized)
-    {
-        GSUSB_LOGI("GSUSB", "Reconfig CAN: stopping + uninstall before reinstall");
-        if (can_active)
-        {
-            esp_err_t stop_err = twai_stop();
-            GSUSB_LOGI("GSUSB", "twai_stop (reconfig) returned: %s", esp_err_to_name(stop_err));
-            can_active = false;
-        }
-
-        esp_err_t un_err = twai_driver_uninstall();
-        if (un_err != ESP_OK)
-        {
-            GSUSB_LOGE("GSUSB", "twai_driver_uninstall (reconfig) failed: %s", esp_err_to_name(un_err));
-           
-        }
-    }
-
-    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
-    if (err != ESP_OK)
-    {
-        GSUSB_LOGE("GSUSB", "twai_driver_install failed: %s", esp_err_to_name(err));
-        can_initialized = false;
-        return false;
-    }
-
-    can_initialized = true;
-    GSUSB_LOGI("GSUSB", "twai_driver_install OK");
-    return true;
-}
-
-static void stop_can()
-{
-    if (!can_initialized)
-    {
-        GSUSB_LOGW("GSUSB", "stop_can called but CAN not initialized");
-        return;
-    }
-
-    if (can_active)
-    {
-        esp_err_t err = twai_stop();
-        if (err == ESP_OK)
-        {
-            GSUSB_LOGI("GSUSB", "CAN stopped (MODE RESET)");
-        }
-        else
-        {
-            GSUSB_LOGE("GSUSB", "twai_stop failed in stop_can: %s", esp_err_to_name(err));
-        }
-        can_active = false;
-    }
-    else
-    {
-        GSUSB_LOGI("GSUSB", "stop_can: CAN already inactive");
-    }
-}
 
 extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                            uint8_t stage,
@@ -178,7 +83,7 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
 
         switch (request->bRequest)
         {
-      
+     
         case GS_USB_BREQ_IDENTIFY:
             GSUSB_LOGI("GSUSB", "REQ IDENTIFY");
             return tud_control_xfer(rhport,
@@ -200,7 +105,7 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                     (void *)&gs_resp_btc,
                                     sizeof(gs_resp_btc));
 
-        
+
         case GS_USB_BREQ_HOST_FORMAT:
             GSUSB_LOGI("GSUSB", "REQ HOST_FORMAT (OUT)");
             return tud_control_xfer(rhport,
@@ -223,14 +128,21 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                     sizeof(temp_mode));
 
         default:
-            GSUSB_LOGE("GSUSB", "Unsupported vendor request in SETUP: bReq=%u", request->bRequest);
+            GSUSB_LOGE("GSUSB",
+                       "Unsupported vendor request in SETUP: bReq=%u",
+                       request->bRequest);
             return false;
         }
         break;
 
     case CONTROL_STAGE_DATA:
+    {
         GSUSB_LOGI("GSUSB", "CTRL DATA stage: bReq=%u", request->bRequest);
-        xSemaphoreTake(can_mutex, portMAX_DELAY);
+        SemaphoreHandle_t mtx = gsusb_can_get_mutex();
+        if (mtx)
+        {
+            xSemaphoreTake(mtx, portMAX_DELAY);
+        }
 
         if (request->bRequest == GS_USB_BREQ_BITTIMING)
         {
@@ -244,9 +156,9 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
                        temp_bt.sjw,
                        temp_bt.brp);
 
-            if (!set_can_bittiming(&temp_bt))
+            if (!gsusb_can_set_bittiming(&temp_bt))
             {
-                GSUSB_LOGE("GSUSB", "set_can_bittiming failed in CTRL DATA");
+                GSUSB_LOGE("GSUSB", "gsusb_can_set_bittiming failed in CTRL DATA");
             }
         }
         else if (request->bRequest == GS_USB_BREQ_MODE)
@@ -256,32 +168,21 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
 
             if (temp_mode.mode == GS_CAN_MODE_START)
             {
-                if (!can_initialized)
+                if (!gsusb_can_is_initialized())
                 {
-                    GSUSB_LOGE("GSUSB", "MODE START but CAN not initialized (no BITTIMING yet)");
-                }
-                else if (!can_active)
-                {
-                    esp_err_t err = twai_start();
-                    if (err == ESP_OK)
-                    {
-                        can_active = true;
-                        GSUSB_LOGI("GSUSB", "twai_start OK, CAN active");
-                    }
-                    else
-                    {
-                        GSUSB_LOGE("GSUSB", "twai_start failed: %s", esp_err_to_name(err));
-                    }
+                    GSUSB_LOGE("GSUSB",
+                               "MODE START but CAN not initialized (no BITTIMING yet)");
                 }
                 else
                 {
-                    GSUSB_LOGI("GSUSB", "MODE START received but CAN already active");
+                    esp_err_t err = gsusb_can_start();
+                    (void)err; // already logged inside
                 }
             }
             else if (temp_mode.mode == GS_CAN_MODE_RESET)
             {
                 GSUSB_LOGI("GSUSB", "MODE RESET received");
-                stop_can();
+                gsusb_can_stop();
             }
             else
             {
@@ -289,8 +190,13 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
             }
         }
 
-        xSemaphoreGive(can_mutex);
+        if (mtx)
+        {
+            xSemaphoreGive(mtx);
+        }
+
         return true;
+    }
 
     case CONTROL_STAGE_ACK:
         GSUSB_LOGI("GSUSB", "CTRL ACK stage bReq=%u", request->bRequest);
@@ -300,7 +206,6 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
         return true;
     }
 }
-
 
 extern "C" void tud_vendor_rx_cb(uint8_t itf, uint8_t const *buffer, uint16_t bufsize)
 {
@@ -329,21 +234,21 @@ extern "C" void can_rx_task(void *arg)
 
     for (;;)
     {
-        if (!can_initialized || !can_active)
+        if (!gsusb_can_is_initialized() || !gsusb_can_is_active())
         {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        ret = twai_receive(&msg, pdMS_TO_TICKS(1000));
+        ret = gsusb_can_receive(&msg, pdMS_TO_TICKS(1000));
 
         if (ret == ESP_OK)
         {
             if (tud_vendor_mounted())
             {
                 memset(&frame, 0, sizeof(frame));
-                // RX frame
-                frame.echo_id  = 0xFFFFFFFF; 
+
+                frame.echo_id  = 0xFFFFFFFF; // RX frame
                 frame.channel  = 0;
                 frame.flags    = 0;
                 frame.reserved = 0;
@@ -352,13 +257,11 @@ extern "C" void can_rx_task(void *arg)
 
                 if (msg.extd)
                 {
-                    // CAN_EFF_FLAG
-                    frame.can_id |= 0x80000000U; 
+                    frame.can_id |= 0x80000000U; // CAN_EFF_FLAG
                 }
                 if (msg.rtr)
                 {
-                     // CAN_RTR_FLAG
-                    frame.can_id |= 0x40000000U;
+                    frame.can_id |= 0x40000000U; // CAN_RTR_FLAG
                 }
 
                 frame.can_dlc = msg.data_length_code;
@@ -397,13 +300,18 @@ extern "C" void can_rx_task(void *arg)
                 }
             }
         }
+        else if (ret == ESP_ERR_INVALID_STATE)
+        {
+         
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
         else if (ret == ESP_ERR_TIMEOUT)
         {
             continue;
         }
         else
         {
-            GSUSB_LOGE("GSUSB", "twai_receive error: %s", esp_err_to_name(ret));
+            GSUSB_LOGE("GSUSB", "gsusb_can_receive error: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -438,9 +346,13 @@ extern "C" void usb_tx_task(void *arg)
                        "USB RX: echo_id=%" PRIu32 " can_id=0x%08" PRIx32 " dlc=%u",
                        frame.echo_id, frame.can_id, frame.can_dlc);
 
-            xSemaphoreTake(can_mutex, portMAX_DELAY);
+            SemaphoreHandle_t mtx = gsusb_can_get_mutex();
+            if (mtx)
+            {
+                xSemaphoreTake(mtx, portMAX_DELAY);
+            }
 
-            if (can_initialized && can_active)
+            if (gsusb_can_is_initialized() && gsusb_can_is_active())
             {
                 memset(&msg, 0, sizeof(msg));
                 msg.extd = (frame.can_id & 0x80000000U) ? 1 : 0;
@@ -451,10 +363,11 @@ extern "C" void usb_tx_task(void *arg)
                     msg.data_length_code = 8;
                 memcpy(msg.data, frame.data, msg.data_length_code);
 
-                esp_err_t tx_err = twai_transmit(&msg, 0);
+                esp_err_t tx_err = gsusb_can_transmit(&msg, 0);
                 if (tx_err != ESP_OK)
                 {
-                    GSUSB_LOGE("GSUSB", "twai_transmit failed: %s", esp_err_to_name(tx_err));
+                    GSUSB_LOGE("GSUSB", "gsusb_can_transmit failed: %s",
+                               esp_err_to_name(tx_err));
                 }
                 else
                 {
@@ -470,10 +383,14 @@ extern "C" void usb_tx_task(void *arg)
             }
             else
             {
-                GSUSB_LOGW("GSUSB", "USB RX frame but CAN is not active/initialized");
+                GSUSB_LOGW("GSUSB",
+                           "USB RX frame but CAN is not active/initialized");
             }
 
-            xSemaphoreGive(can_mutex);
+            if (mtx)
+            {
+                xSemaphoreGive(mtx);
+            }
         }
     }
 }
@@ -486,14 +403,12 @@ extern "C" void tinyusb_task(void *param)
     for (;;)
     {
         tud_task();
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
 
-
 static const uint8_t vendor_conf_desc[] = {
-    
+  
     9, TUSB_DESC_CONFIGURATION,
     U16_TO_U8S_LE(TUSB_DESC_TOTAL_LEN),
     1,    // Number of interfaces
@@ -527,15 +442,9 @@ static const uint8_t vendor_conf_desc[] = {
     0
 };
 
-
-void gsusb_init(void)
+esp_err_t gsusb_init(void)
 {
-    can_mutex = xSemaphoreCreateMutex();
-    if (can_mutex == nullptr)
-    {
-        printf("Failed to create CAN mutex.\n");
-        return;
-    }
+    gsusb_can_init();  
 
     tinyusb_config_t tusb_cfg = {};
     tusb_cfg.external_phy = false;
@@ -544,16 +453,17 @@ void gsusb_init(void)
     esp_err_t err = tinyusb_driver_install(&tusb_cfg);
     if (err != ESP_OK)
     {
-        printf("tinyusb_driver_install failed: %d\n", (int)err);
-        return;
+        GSUSB_LOGI("gsusb_init","tinyusb_driver_install failed: %d", (int)err);
+        return err;
     }
 
     xTaskCreate(tinyusb_task, "tinyusb", 4096, nullptr, 10, nullptr);
     xTaskCreate(can_rx_task, "can_rx", 4096, nullptr, 9, nullptr);
     xTaskCreate(usb_tx_task, "usb_tx", 4096, nullptr, 8, &h_usb_tx_task);
 
-    printf("CandleLight Firmware Running (GS-USB, modularized).\n");
+    GSUSB_LOGI("gsusb_init","CandleLight Firmware Running (GS-USB, split USB/CAN).");
 
-    LedService::getInstance().start();
-    LedService::getInstance().setStatusLed(3);
+    return ESP_OK;
+
+
 }

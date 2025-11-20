@@ -2,3 +2,4 @@
 
 #define  TX_CAN GPIO_NUM_42
 #define  RX_CAN GPIO_NUM_41
+#define  RGB_PIN GPIO_NUM_38

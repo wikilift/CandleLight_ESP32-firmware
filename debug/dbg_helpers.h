@@ -1,4 +1,5 @@
-#define GSUSB_DEBUG 1
+#pragma once
+#define GSUSB_DEBUG 0
 
 #if GSUSB_DEBUG
     #define GSUSB_LOGI(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
