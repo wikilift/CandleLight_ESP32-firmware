@@ -176,7 +176,7 @@ extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 else
                 {
                     esp_err_t err = gsusb_can_start();
-                    (void)err; // already logged inside
+                    (void)err; 
                 }
             }
             else if (temp_mode.mode == GS_CAN_MODE_RESET)
