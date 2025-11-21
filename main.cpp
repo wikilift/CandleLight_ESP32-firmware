@@ -1,5 +1,6 @@
 #include "gsusb_usb.h"
 #include "led_service.h"
+
 extern "C" void app_main()
 {
     LedService::getInstance().start();
